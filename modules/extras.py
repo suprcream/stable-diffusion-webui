@@ -1,12 +1,13 @@
 import os
 import re
 import shutil
+import json
 
 
 import torch
 import tqdm
 
-from modules import shared, images, sd_models, sd_vae, sd_models_config
+from modules import shared, images, sd_models, sd_vae, sd_models_config, errors
 from modules.ui_common import plaintext_to_html
 import gradio as gr
 import safetensors.torch
@@ -71,9 +72,21 @@ def to_half(tensor, enable):
     return tensor
 
 
-def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_model_name, interp_method, multiplier, save_as_half, custom_name, checkpoint_format, config_source, bake_in_vae, discard_weights):
-    shared.state.begin()
-    shared.state.job = 'model-merge'
+def read_metadata(primary_model_name, secondary_model_name, tertiary_model_name):
+    metadata = {}
+
+    for checkpoint_name in [primary_model_name, secondary_model_name, tertiary_model_name]:
+        checkpoint_info = sd_models.checkpoints_list.get(checkpoint_name, None)
+        if checkpoint_info is None:
+            continue
+
+        metadata.update(checkpoint_info.metadata)
+
+    return json.dumps(metadata, indent=4, ensure_ascii=False)
+
+
+def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_model_name, interp_method, multiplier, save_as_half, custom_name, checkpoint_format, config_source, bake_in_vae, discard_weights, save_metadata, add_merge_recipe, copy_metadata_fields, metadata_json):
+    shared.state.begin(job="model-merge")
 
     def fail(message):
         shared.state.textinfo = message
@@ -135,14 +148,14 @@ def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_
     result_is_instruct_pix2pix_model = False
 
     if theta_func2:
-        shared.state.textinfo = f"Loading B"
+        shared.state.textinfo = "Loading B"
         print(f"Loading {secondary_model_info.filename}...")
         theta_1 = sd_models.read_state_dict(secondary_model_info.filename, map_location='cpu')
     else:
         theta_1 = None
 
     if theta_func1:
-        shared.state.textinfo = f"Loading C"
+        shared.state.textinfo = "Loading C"
         print(f"Loading {tertiary_model_info.filename}...")
         theta_2 = sd_models.read_state_dict(tertiary_model_info.filename, map_location='cpu')
 
@@ -198,7 +211,7 @@ def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_
                     result_is_inpainting_model = True
             else:
                 theta_0[key] = theta_func2(a, b, multiplier)
-            
+
             theta_0[key] = to_half(theta_0[key], save_as_half)
 
         shared.state.sampling_step += 1
@@ -241,13 +254,72 @@ def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_
     shared.state.textinfo = "Saving"
     print(f"Saving to {output_modelname}...")
 
+    metadata = {}
+
+    if save_metadata and copy_metadata_fields:
+        if primary_model_info:
+            metadata.update(primary_model_info.metadata)
+        if secondary_model_info:
+            metadata.update(secondary_model_info.metadata)
+        if tertiary_model_info:
+            metadata.update(tertiary_model_info.metadata)
+
+    if save_metadata:
+        try:
+            metadata.update(json.loads(metadata_json))
+        except Exception as e:
+            errors.display(e, "readin metadata from json")
+
+        metadata["format"] = "pt"
+
+    if save_metadata and add_merge_recipe:
+        merge_recipe = {
+            "type": "webui", # indicate this model was merged with webui's built-in merger
+            "primary_model_hash": primary_model_info.sha256,
+            "secondary_model_hash": secondary_model_info.sha256 if secondary_model_info else None,
+            "tertiary_model_hash": tertiary_model_info.sha256 if tertiary_model_info else None,
+            "interp_method": interp_method,
+            "multiplier": multiplier,
+            "save_as_half": save_as_half,
+            "custom_name": custom_name,
+            "config_source": config_source,
+            "bake_in_vae": bake_in_vae,
+            "discard_weights": discard_weights,
+            "is_inpainting": result_is_inpainting_model,
+            "is_instruct_pix2pix": result_is_instruct_pix2pix_model
+        }
+
+        sd_merge_models = {}
+
+        def add_model_metadata(checkpoint_info):
+            checkpoint_info.calculate_shorthash()
+            sd_merge_models[checkpoint_info.sha256] = {
+                "name": checkpoint_info.name,
+                "legacy_hash": checkpoint_info.hash,
+                "sd_merge_recipe": checkpoint_info.metadata.get("sd_merge_recipe", None)
+            }
+
+            sd_merge_models.update(checkpoint_info.metadata.get("sd_merge_models", {}))
+
+        add_model_metadata(primary_model_info)
+        if secondary_model_info:
+            add_model_metadata(secondary_model_info)
+        if tertiary_model_info:
+            add_model_metadata(tertiary_model_info)
+
+        metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
+        metadata["sd_merge_models"] = json.dumps(sd_merge_models)
+
     _, extension = os.path.splitext(output_modelname)
     if extension.lower() == ".safetensors":
-        safetensors.torch.save_file(theta_0, output_modelname, metadata={"format": "pt"})
+        safetensors.torch.save_file(theta_0, output_modelname, metadata=metadata if len(metadata)>0 else None)
     else:
         torch.save(theta_0, output_modelname)
 
     sd_models.list_models()
+    created_model = next((ckpt for ckpt in sd_models.checkpoints_list.values() if ckpt.name == filename), None)
+    if created_model:
+        created_model.calculate_shorthash()
 
     create_config(output_modelname, config_source, primary_model_info, secondary_model_info, tertiary_model_info)
 
